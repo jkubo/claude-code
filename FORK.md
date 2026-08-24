@@ -66,6 +66,32 @@ this tree. File an issue there instead if something is genuinely upstream's bug.
 branches. It only pushes when the rebase is clean; a conflicting day is left
 for a human, which is the correct failure mode for a tree nobody is watching.
 
+## Inherited workflows
+
+A fork inherits upstream's Actions. Three of them are on a `schedule`, so they
+fire here regardless of whether this fork has any issues, and they need
+Anthropic secrets that do not exist in this repo. They were **disabled at the
+repository level**, not deleted:
+
+- `auto-close-duplicates.yml`
+- `lock-closed-issues.yml`
+- `sweep.yml`
+
+Disabled rather than deleted on purpose. Deleting them would put fork delta on
+files upstream actively edits, so every upstream change to one of them becomes a
+rebase conflict, forever, for no benefit. A repo setting is invisible in the
+tree, which is the one drawback, and is why it is written down here.
+
+To check or change:
+
+```sh
+gh workflow list --repo jkubo/claude-code --all
+gh workflow disable <file>.yml --repo jkubo/claude-code
+```
+
+The remaining upstream workflows are triggered by issue and PR events. This
+fork receives none, so they never run.
+
 ## Adding a local plugin
 
 1. Create `plugins/<name>/` following the layout of an existing plugin.
