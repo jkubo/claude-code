@@ -81,8 +81,16 @@ fi
 
 # 1. main is a pure mirror. --ff-only is the assertion that it never drifted;
 #    if someone committed to main, this fails loudly instead of merging.
+#    CI checks out only jkubo, so local main may not exist. After fetching
+#    origin and upstream, `git checkout main` is DWIM-ambiguous
+#    (origin/main and upstream/main). Create it from origin/main when
+#    missing; do not reset an existing local main.
 log "fast forwarding $MIRROR_BRANCH to $UPSTREAM_REMOTE/$UPSTREAM_BRANCH"
-git checkout --quiet "$MIRROR_BRANCH"
+if git show-ref --verify --quiet "refs/heads/$MIRROR_BRANCH"; then
+  git checkout --quiet "$MIRROR_BRANCH"
+else
+  git checkout --quiet -B "$MIRROR_BRANCH" "$ORIGIN_REMOTE/$MIRROR_BRANCH"
+fi
 if ! git merge --ff-only --quiet "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH"; then
   git checkout --quiet "$START_BRANCH" || true
   die "$MIRROR_BRANCH is not a fast forward of upstream. It carries fork delta it should not have."
