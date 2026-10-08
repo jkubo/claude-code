@@ -241,6 +241,91 @@ no_rebase_left() {
     || fail "rebase state left behind in $git_dir"
 }
 
+# Exact refs, index, worktree, and in-progress operation snapshot.
+# Remote-tracking refs are omitted: a refusing run is allowed to fetch.
+capture_state() {
+  local work="$1" dest="$2" git_dir name dir f hash
+  git_dir="$(git -C "$work" rev-parse --absolute-git-dir)"
+  {
+    echo "HEAD=$(git -C "$work" rev-parse HEAD)"
+    echo "symref=$(git -C "$work" symbolic-ref -q HEAD || echo DETACHED)"
+    echo "heads<<"
+    git -C "$work" for-each-ref --format='%(refname) %(objectname)' refs/heads | sort
+    echo ">>"
+    echo "origin-heads<<"
+    git --git-dir="$SB_ROOT/origin.git" for-each-ref --format='%(refname) %(objectname)' refs/heads | sort
+    echo ">>"
+    echo "ls-files-s<<"
+    git -C "$work" ls-files -s
+    echo ">>"
+    echo "ls-files-u<<"
+    git -C "$work" ls-files -u
+    echo ">>"
+    echo "porcelain<<"
+    git -C "$work" status --porcelain=v1 --untracked-files=all
+    echo ">>"
+    echo "diff-cached<<"
+    git -C "$work" diff --cached --binary
+    echo ">>"
+    echo "diff<<"
+    git -C "$work" diff --binary
+    echo ">>"
+    echo "untracked<<"
+    git -C "$work" ls-files --others --exclude-standard -z \
+      | while IFS= read -r -d '' f; do
+          hash="$(sha256sum "$work/$f" | awk '{print $1}')"
+          printf '%s %s\n' "$hash" "$f"
+        done
+    echo ">>"
+    for name in CHERRY_PICK_HEAD REVERT_HEAD MERGE_HEAD MERGE_MSG AUTO_MERGE; do
+      if [[ -f "$git_dir/$name" ]]; then
+        hash="$(sha256sum "$git_dir/$name" | awk '{print $1}')"
+        printf 'marker %s %s\n' "$name" "$hash"
+      else
+        echo "marker $name absent"
+      fi
+    done
+    for dir in sequencer rebase-merge rebase-apply; do
+      if [[ -d "$git_dir/$dir" ]]; then
+        echo "dir $dir present"
+        (
+          cd "$git_dir/$dir" && find . -type f -print | sort | while read -r f; do
+            hash="$(sha256sum "$f" | awk '{print $1}')"
+            printf 'op %s %s %s\n' "$dir" "$f" "$hash"
+          done
+        )
+      else
+        echo "dir $dir absent"
+      fi
+    done
+  } >"$dest"
+}
+
+assert_state_unchanged() {
+  local work="$1" before="$2" after="$SB_ROOT/state-after"
+  capture_state "$work" "$after"
+  if ! cmp -s "$before" "$after"; then
+    diff -u "$before" "$after" >&2 || true
+    fail "refs, index, worktree, or operation state changed"
+  fi
+}
+
+# Commit on a second clone and push to origin's fork branch. The fixture
+# clone is not fetched, so its remote-tracking ref stays stale on purpose.
+publish_side_fork() {
+  local filename="$1" content="$2" message="$3" side="$SB_ROOT/side"
+  rm -rf "$side"
+  git clone -q -b jkubo "$SB_ROOT/origin.git" "$side"
+  git -C "$side" config user.name "Jay Kubo"
+  git -C "$side" config user.email "6161465+jkubo@users.noreply.github.com"
+  git -C "$side" config commit.gpgsign false
+  printf '%s\n' "$content" >"$side/$filename"
+  git -C "$side" add -- "$filename"
+  git -C "$side" commit -q -m "$message"
+  SIDE_TIP="$(git -C "$side" rev-parse HEAD)"
+  git -C "$side" push -q origin "HEAD:refs/heads/jkubo"
+}
+
 scenario_success() {
   new_sandbox
   local work="$SB_ROOT/work"
@@ -508,6 +593,253 @@ scenario_lease() {
   say "push lease rollback"
 }
 
+scenario_remote_advanced() {
+  new_sandbox
+  local work="$SB_ROOT/work" tip main_sha before
+  seed_fork "$work"
+  advance_upstream "$work" bash -c "printf 'upstream-moved\n' > README.md"
+  tip="$(git -C "$work" rev-parse jkubo)"
+  main_sha="$(git -C "$work" rev-parse main)"
+  assert_eq "$(git -C "$work" rev-parse refs/remotes/origin/jkubo)" "$tip" \
+    "fixture remote-tracking fork is the pre-fetch tip"
+  publish_side_fork "REMOTE_ONLY.md" "remote-only" "remote only"
+  assert_eq "$(ref_sha "$SB_ROOT/origin.git" jkubo)" "$SIDE_TIP" \
+    "bare origin fork advanced before fetch"
+  git -C "$SB_ROOT/side" merge-base --is-ancestor "$tip" "$SIDE_TIP" \
+    || fail "remote-only commit does not contain the local tip"
+  install_hook "$work"
+  before="$SB_ROOT/state-before"
+  capture_state "$work" "$before"
+  run_sync "$work" --push
+  assert_rc 1 "remote advanced before fetch"
+  grep -F "is not an ancestor of local" "$SYNC_LOG" >/dev/null \
+    || fail "remote-advanced error missing"
+  grep -F "Refusing to rebase or push" "$SYNC_LOG" >/dev/null \
+    || fail "remote-advanced refusal missing"
+  assert_state_unchanged "$work" "$before"
+  assert_eq "$(git -C "$work" rev-parse jkubo)" "$tip" "local jkubo not rebased"
+  assert_eq "$(git -C "$work" rev-parse main)" "$main_sha" "local main not moved"
+  assert_eq "$(ref_sha "$SB_ROOT/origin.git" jkubo)" "$SIDE_TIP" "origin jkubo kept remote commit"
+  assert_eq "$(ref_sha "$SB_ROOT/origin.git" main)" "$main_sha" "origin main not pushed"
+  assert_eq "$(git -C "$work" rev-parse refs/remotes/origin/jkubo)" "$SIDE_TIP" \
+    "fetch observed the remote-only tip"
+  assert_eq "$(git --git-dir="$SB_ROOT/origin.git" show "${SIDE_TIP}:REMOTE_ONLY.md")" \
+    "remote-only" "REMOTE_ONLY.md still on origin"
+  assert_eq "$(git -C "$work" show jkubo:README.md)" "base" \
+    "local fork was not rebased onto upstream"
+  assert_eq "$(out_value changed "$EVIDENCE")" "false" "changed after remote-advanced refusal"
+  assert_eq "$(out_value sha "$EVIDENCE")" "$tip" "sha after remote-advanced refusal"
+  [[ ! -s "$HOOK_LOG" ]] || fail "remote-advanced refusal pushed"
+  no_rebase_left "$work"
+  say "remote advanced before fetch"
+}
+
+scenario_divergent_fork() {
+  new_sandbox
+  local work="$SB_ROOT/work" tip main_sha before
+  seed_fork "$work"
+  main_sha="$(git -C "$work" rev-parse main)"
+  printf 'local-only\n' >"$work/LOCAL_ONLY.md"
+  commit_tree "$work" "local only"
+  tip="$(git -C "$work" rev-parse jkubo)"
+  publish_side_fork "REMOTE_ONLY.md" "remote-only" "remote only"
+  git -C "$SB_ROOT/side" fetch -q "$work" "refs/heads/jkubo:refs/tmp/local-jkubo"
+  if git -C "$SB_ROOT/side" merge-base --is-ancestor "$SIDE_TIP" refs/tmp/local-jkubo; then
+    fail "divergent fixture: remote tip is an ancestor of local"
+  fi
+  if git -C "$SB_ROOT/side" merge-base --is-ancestor refs/tmp/local-jkubo "$SIDE_TIP"; then
+    fail "divergent fixture: local tip is an ancestor of remote"
+  fi
+  install_hook "$work"
+  before="$SB_ROOT/state-before"
+  capture_state "$work" "$before"
+  run_sync "$work" --push
+  assert_rc 1 "divergent fork"
+  grep -F "is not an ancestor of local" "$SYNC_LOG" >/dev/null \
+    || fail "divergent error missing"
+  assert_state_unchanged "$work" "$before"
+  assert_eq "$(git -C "$work" rev-parse jkubo)" "$tip" "divergent local jkubo unchanged"
+  assert_eq "$(git -C "$work" show jkubo:LOCAL_ONLY.md)" "local-only" \
+    "local-only commit kept"
+  if git -C "$work" cat-file -e "jkubo:REMOTE_ONLY.md" 2>/dev/null; then
+    fail "local jkubo absorbed REMOTE_ONLY.md"
+  fi
+  assert_eq "$(ref_sha "$SB_ROOT/origin.git" jkubo)" "$SIDE_TIP" \
+    "origin jkubo kept the divergent commit"
+  assert_eq "$(git --git-dir="$SB_ROOT/origin.git" show "${SIDE_TIP}:REMOTE_ONLY.md")" \
+    "remote-only" "REMOTE_ONLY.md still on divergent origin"
+  if git --git-dir="$SB_ROOT/origin.git" cat-file -e "${SIDE_TIP}:LOCAL_ONLY.md" 2>/dev/null; then
+    fail "origin jkubo absorbed LOCAL_ONLY.md"
+  fi
+  assert_eq "$(ref_sha "$SB_ROOT/origin.git" main)" "$main_sha" "divergent origin main unchanged"
+  assert_eq "$(out_value changed "$EVIDENCE")" "false" "changed after divergent refusal"
+  [[ ! -s "$HOOK_LOG" ]] || fail "divergent refusal pushed"
+  no_rebase_left "$work"
+  say "divergent fork history"
+}
+
+scenario_local_ahead() {
+  new_sandbox
+  local work="$SB_ROOT/work" origin_before tip
+  seed_fork "$work"
+  advance_upstream "$work" bash -c "printf 'upstream-moved\n' > README.md"
+  origin_before="$(ref_sha "$SB_ROOT/origin.git" jkubo)"
+  printf 'keep\n' >"$work/LOCAL_KEEP.md"
+  commit_tree "$work" "local keep"
+  tip="$(git -C "$work" rev-parse jkubo)"
+  git -C "$work" merge-base --is-ancestor "$origin_before" "$tip" \
+    || fail "local-ahead fixture is not ahead of origin"
+  [[ "$tip" != "$origin_before" ]] || fail "local-ahead fixture did not add a commit"
+  install_hook "$work"
+  run_sync "$work" --push
+  assert_rc 0 "local ahead of origin"
+  if grep -F "is not an ancestor of local" "$SYNC_LOG"; then
+    fail "local-ahead sync was refused"
+  fi
+  assert_eq "$(git -C "$work" rev-parse jkubo~2)" "$UP_SHA" \
+    "rebased local-ahead history is based on upstream"
+  assert_eq "$(git -C "$work" show jkubo:LOCAL_KEEP.md)" "keep" "local commit survived rebase"
+  assert_eq "$(git -C "$work" show jkubo:README.md)" "upstream-moved" \
+    "local-ahead fork picked up upstream"
+  assert_eq "$(ref_sha "$SB_ROOT/origin.git" jkubo)" "$(git -C "$work" rev-parse jkubo)" \
+    "origin jkubo received the rebased local commit"
+  assert_eq "$(ref_sha "$SB_ROOT/origin.git" main)" "$UP_SHA" "local-ahead origin main"
+  assert_eq "$(grep -c hooked "$HOOK_LOG")" "1" "local-ahead push used the normal hook"
+  say "local fork ahead of origin"
+}
+
+scenario_paused_cherry_pick() {
+  new_sandbox
+  local work="$SB_ROOT/work" already extra git_dir before cp_rc
+  seed_fork "$work"
+  install_hook "$work"
+  git -C "$work" checkout -q -b source
+  printf 'already\n' >"$work/SAME.md"
+  commit_tree "$work" "already"
+  already="$(git -C "$work" rev-parse HEAD)"
+  printf 'extra\n' >"$work/EXTRA.md"
+  commit_tree "$work" "extra"
+  extra="$(git -C "$work" rev-parse HEAD)"
+  git -C "$work" checkout -q jkubo
+  printf 'already\n' >"$work/SAME.md"
+  commit_tree "$work" "preimage"
+  set +e
+  git -C "$work" cherry-pick "$already" "$extra" >"$SB_ROOT/cherry.out" 2>&1
+  cp_rc=$?
+  set -e
+  [[ "$cp_rc" -ne 0 ]] || fail "empty multi cherry-pick did not stop"
+  git_dir="$(git -C "$work" rev-parse --absolute-git-dir)"
+  [[ -f "$git_dir/CHERRY_PICK_HEAD" ]] || fail "paused cherry-pick has no CHERRY_PICK_HEAD"
+  [[ -d "$git_dir/sequencer" ]] || fail "paused cherry-pick has no sequencer"
+  [[ -z "$(git -C "$work" status --porcelain)" ]] \
+    || fail "paused cherry-pick porcelain was not empty: $(git -C "$work" status --porcelain)"
+  before="$SB_ROOT/state-before"
+  capture_state "$work" "$before"
+
+  run_sync "$work" --push
+  assert_rc 1 "paused cherry-pick"
+  grep -F "cherry-pick already in progress; refusing to abort it" "$SYNC_LOG" >/dev/null \
+    || fail "cherry-pick refusal missing"
+  assert_state_unchanged "$work" "$before"
+  [[ ! -s "$HOOK_LOG" ]] || fail "cherry-pick refusal pushed"
+
+  run_sync "$work" --allow-dirty --push
+  assert_rc 1 "paused cherry-pick with --allow-dirty"
+  grep -F "cherry-pick already in progress; refusing to abort it" "$SYNC_LOG" >/dev/null \
+    || fail "allow-dirty cherry-pick refusal missing"
+  assert_state_unchanged "$work" "$before"
+  [[ ! -s "$HOOK_LOG" ]] || fail "allow-dirty cherry-pick refusal pushed"
+
+  printf 'dirty\n' >>"$work/README.md"
+  capture_state "$work" "$before"
+  run_sync "$work" --allow-dirty --push
+  assert_rc 1 "dirty paused cherry-pick with --allow-dirty"
+  grep -F "cherry-pick already in progress; refusing to abort it" "$SYNC_LOG" >/dev/null \
+    || fail "dirty allow-dirty cherry-pick refusal missing"
+  assert_state_unchanged "$work" "$before"
+  grep -F 'dirty' "$work/README.md" >/dev/null || fail "dirty worktree line was lost"
+  [[ ! -s "$HOOK_LOG" ]] || fail "dirty cherry-pick refusal pushed"
+  say "paused multi-commit cherry-pick"
+}
+
+scenario_revert_sequencer() {
+  new_sandbox
+  local work="$SB_ROOT/work" one two git_dir before rv_rc
+  seed_fork "$work"
+  install_hook "$work"
+  printf 'one\n' >"$work/ONE.md"
+  commit_tree "$work" "one"
+  one="$(git -C "$work" rev-parse HEAD)"
+  printf 'two\n' >"$work/TWO.md"
+  commit_tree "$work" "two"
+  two="$(git -C "$work" rev-parse HEAD)"
+  git -C "$work" rm -q ONE.md
+  commit_tree "$work" "undo one"
+  set +e
+  git -C "$work" -c core.editor=true revert --no-edit "$one" "$two" >"$SB_ROOT/revert.out" 2>&1
+  rv_rc=$?
+  set -e
+  [[ "$rv_rc" -ne 0 ]] || fail "empty multi revert did not stop"
+  git_dir="$(git -C "$work" rev-parse --absolute-git-dir)"
+  [[ ! -f "$git_dir/REVERT_HEAD" ]] || fail "empty multi revert left REVERT_HEAD"
+  [[ -d "$git_dir/sequencer" ]] || fail "empty multi revert has no sequencer"
+  [[ -z "$(git -C "$work" status --porcelain)" ]] \
+    || fail "paused revert porcelain was not empty: $(git -C "$work" status --porcelain)"
+  before="$SB_ROOT/state-before"
+  capture_state "$work" "$before"
+
+  run_sync "$work" --push
+  assert_rc 1 "paused revert sequencer"
+  grep -F "sequencer already in progress; refusing to abort it" "$SYNC_LOG" >/dev/null \
+    || fail "sequencer refusal missing"
+  assert_state_unchanged "$work" "$before"
+  [[ ! -s "$HOOK_LOG" ]] || fail "sequencer refusal pushed"
+
+  run_sync "$work" --allow-dirty --push
+  assert_rc 1 "paused revert sequencer with --allow-dirty"
+  grep -F "sequencer already in progress; refusing to abort it" "$SYNC_LOG" >/dev/null \
+    || fail "allow-dirty sequencer refusal missing"
+  assert_state_unchanged "$work" "$before"
+  [[ ! -s "$HOOK_LOG" ]] || fail "allow-dirty sequencer refusal pushed"
+
+  # A conflicted revert has REVERT_HEAD and a dirty index, and no sequencer.
+  new_sandbox
+  work="$SB_ROOT/work"
+  seed_fork "$work"
+  install_hook "$work"
+  printf 'v1\n' >"$work/C.txt"
+  commit_tree "$work" "c1"
+  one="$(git -C "$work" rev-parse HEAD)"
+  printf 'v2\n' >"$work/C.txt"
+  commit_tree "$work" "c2"
+  set +e
+  git -C "$work" -c core.editor=true revert --no-edit "$one" >"$SB_ROOT/revert.out" 2>&1
+  rv_rc=$?
+  set -e
+  [[ "$rv_rc" -ne 0 ]] || fail "conflicted revert did not stop"
+  git_dir="$(git -C "$work" rev-parse --absolute-git-dir)"
+  [[ -f "$git_dir/REVERT_HEAD" ]] || fail "conflicted revert has no REVERT_HEAD"
+  [[ -n "$(git -C "$work" status --porcelain)" ]] \
+    || fail "conflicted revert porcelain was empty"
+  before="$SB_ROOT/state-before"
+  capture_state "$work" "$before"
+
+  run_sync "$work" --push
+  assert_rc 1 "conflicted revert"
+  grep -F "revert already in progress; refusing to abort it" "$SYNC_LOG" >/dev/null \
+    || fail "revert refusal missing"
+  assert_state_unchanged "$work" "$before"
+  [[ ! -s "$HOOK_LOG" ]] || fail "revert refusal pushed"
+
+  run_sync "$work" --allow-dirty --push
+  assert_rc 1 "conflicted revert with --allow-dirty"
+  grep -F "revert already in progress; refusing to abort it" "$SYNC_LOG" >/dev/null \
+    || fail "allow-dirty revert refusal missing"
+  assert_state_unchanged "$work" "$before"
+  [[ ! -s "$HOOK_LOG" ]] || fail "allow-dirty revert refusal pushed"
+  say "revert and sequencer refusal"
+}
+
 scenario_success
 scenario_noop
 scenario_workflow_update
@@ -517,4 +849,9 @@ scenario_exact_head
 scenario_dirty
 scenario_absent_token
 scenario_lease
+scenario_remote_advanced
+scenario_divergent_fork
+scenario_local_ahead
+scenario_paused_cherry_pick
+scenario_revert_sequencer
 say "all scenarios passed"

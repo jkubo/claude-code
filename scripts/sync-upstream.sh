@@ -163,6 +163,19 @@ refuse_in_progress() {
   if [[ -f "$git_dir/MERGE_HEAD" ]]; then
     die "merge already in progress; refusing to abort it"
   fi
+  # An empty multi-commit cherry-pick leaves CHERRY_PICK_HEAD and sequencer
+  # while `git status --porcelain` is empty. A paused revert leaves
+  # REVERT_HEAD, sequencer, or both. Checkout and rebase clear the HEAD
+  # files and orphan sequencer. These operations belong to the operator.
+  if [[ -f "$git_dir/CHERRY_PICK_HEAD" ]]; then
+    die "cherry-pick already in progress; refusing to abort it"
+  fi
+  if [[ -f "$git_dir/REVERT_HEAD" ]]; then
+    die "revert already in progress; refusing to abort it"
+  fi
+  if [[ -d "$git_dir/sequencer" ]]; then
+    die "sequencer already in progress; refusing to abort it"
+  fi
 }
 
 update_mirror() {
@@ -198,6 +211,10 @@ update_mirror() {
 cd "$ROOT"
 [[ -d .git ]] || die "not a git repo: $ROOT"
 
+# Before any checkout. --allow-dirty and --dry-run do not bypass this, and
+# the script does not abort an operation it did not start.
+refuse_in_progress
+
 # A dirty tree plus a rebase is how you lose work that was never committed.
 # Exempt --dry-run: it mutates nothing, so refusing there would make the one
 # command that is always safe the one command you cannot run when you most
@@ -206,7 +223,6 @@ if [[ "$DO_DRY" -eq 0 && "$ALLOW_DIRTY" -eq 0 ]] && [[ -n "$(git status --porcel
   die "working tree is dirty. Commit, stash, or pass --allow-dirty."
 fi
 
-refuse_in_progress
 START_BRANCH="$(git symbolic-ref --short -q HEAD || echo "$FORK_BRANCH")"
 git show-ref --verify --quiet "refs/heads/$FORK_BRANCH" \
   || die "local branch $FORK_BRANCH does not exist"
@@ -242,6 +258,21 @@ git fetch --quiet "$ORIGIN_REMOTE"
 
 if git show-ref --verify --quiet "refs/remotes/$ORIGIN_REMOTE/$FORK_BRANCH"; then
   FORK_LEASE="$(git rev-parse "refs/remotes/$ORIGIN_REMOTE/$FORK_BRANCH")"
+fi
+
+# The lease is the fork tip this fetch just observed. It only pins the later
+# atomic push. It is not permission to rebase. The fetched origin tip must
+# already be an ancestor of the local fork tip recorded before the fetch.
+# The same commit, and local commits the remote does not have yet, continue.
+# A remote commit this local tip does not contain (the remote moved ahead
+# before fetch, or the histories diverged) stops here, before MUTATED and
+# before any checkout, rebase, or main update. Rebasing the older local tip
+# and pushing it with a lease of that new remote SHA would delete the remote
+# commit. There is no flag that picks a side.
+if [[ -n "$FORK_LEASE" ]]; then
+  if ! git merge-base --is-ancestor "$FORK_LEASE" "$FORK_BEFORE"; then
+    die "origin/$FORK_BRANCH ${FORK_LEASE} is not an ancestor of local $FORK_BRANCH ${FORK_BEFORE}. Refusing to rebase or push. See FORK.md."
+  fi
 fi
 
 # Rebase jkubo before moving main. A conflict then has nothing to undo on main.

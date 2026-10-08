@@ -64,6 +64,54 @@ on. `main` is updated only when that update is a fast forward onto the exact
 upstream commit. A `main` that is ahead of upstream, or has diverged, is left
 where it was.
 
+### Remote commits on origin/jkubo
+
+The script records the local `jkubo` tip, fetches, then reads the fetched
+`origin/jkubo` tip. That fetched commit has to be contained in the recorded
+local tip before the script checks out, rebases, or moves `main`.
+
+Two cases continue. The fetched tip and the local tip are the same commit.
+Or the local tip already has commits the fetched tip does not have yet. The
+later push uses the fetched SHA as its lease, so those local commits can be
+published on top of the remote the fetch actually saw.
+
+The script stops when the fetched tip contains a commit the recorded local
+tip does not. The remote branch moved ahead of this clone before fetch, or
+the two histories diverged. The exit is before checkout. Local `jkubo`,
+local `main`, `origin/jkubo`, and `origin/main` stay on the commits they
+had. The index, the worktree, and any cherry-pick, revert, merge, or rebase
+already in progress stay as they were. Fetch updates remote-tracking refs,
+which is how the new tip was observed.
+
+Reconcile that remote work, then run the script again. After the failed run,
+`git log jkubo..origin/jkubo` lists the commits the local tip lacks.
+
+When local `jkubo` has nothing of its own past the previous remote tip,
+fast-forward it to the fetched tip and run the sync again:
+
+```sh
+git merge --ff-only origin/jkubo
+```
+
+When both sides have commits the other lacks, read both ranges
+(`git log jkubo..origin/jkubo` and `git log origin/jkubo..jkubo`) and combine
+them in the worktree yourself. A merge or a rebase you run and inspect is
+that step. Run `./scripts/sync-upstream.sh` again only after local `jkubo`
+contains the fetched `origin/jkubo` commit.
+
+Publishing a local history that was already rebased onto a remote tip you
+have read is outside this script. Do that as its own reviewed push of `main`
+and `jkubo` together, with the lease set to the exact `origin/jkubo` SHA
+observed for that push. This script does not grow a bypass for that case.
+
+A cherry-pick, revert, merge, or rebase already in progress stops the script
+the same way, before checkout. A multi-commit cherry-pick whose first commit
+is empty leaves `CHERRY_PICK_HEAD` and `.git/sequencer` while
+`git status --porcelain` prints nothing. A paused revert leaves `REVERT_HEAD`,
+`.git/sequencer`, or both, and can be just as quiet. The script does not
+abort that operation. Finish it or abort it yourself, then re run.
+`--allow-dirty` does not bypass this stop.
+
 Upstream does not accept external PRs for the bundled plugins, and the CLI is
 not open source, so **do not open a PR against `anthropics/claude-code`** from
 this tree. File an issue there instead if something is genuinely upstream's bug.
