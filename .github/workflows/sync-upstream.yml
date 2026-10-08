@@ -67,8 +67,8 @@ jobs:
       - name: Report
         if: failure() && steps.sync.conclusion == 'failure'
         run: |
-          echo "Sync failed before a successful push."
-          echo "The sync log prints the fork sha and changed flag after rollback."
-          echo "A rebase conflict, a main branch that is not an exact fast-forward, or a rejected push leaves both branches unpushed."
+          echo "Sync failed."
+          echo "Inspect the sync log for the fork sha, main sha, changed flag, and whether publication succeeded."
+          echo "A rejected atomic push leaves remote targets unchanged and keeps completed local work. A later checkout failure can follow a successful push."
           echo "Resolve locally:"
           echo "  ./scripts/sync-upstream.sh"
