@@ -11,9 +11,9 @@ UPSTREAM_PIN="79babc372d64101f981bd2b52c3dbe588596dc56"
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
-  if [[ -n "${CURRENT_WORK:-}" && -f "$CURRENT_WORK/sync.out" ]]; then
-    printf '--- sync.out ---\n' >&2
-    cat "$CURRENT_WORK/sync.out" >&2
+  if [[ -n "${SYNC_LOG:-}" && -f "$SYNC_LOG" ]]; then
+    printf '%s\n' '--- sync.out ---' >&2
+    cat "$SYNC_LOG" >&2
   fi
   exit 1
 }
@@ -22,9 +22,9 @@ say() { printf 'ok: %s\n' "$*"; }
 assert_eq() {
   if [[ "$1" != "$2" ]]; then
     printf 'FAIL: %s\n got: [%s]\n want: [%s]\n' "$3" "$1" "$2" >&2
-    if [[ -n "${CURRENT_WORK:-}" && -f "$CURRENT_WORK/sync.out" ]]; then
-      printf '--- sync.out ---\n' >&2
-      cat "$CURRENT_WORK/sync.out" >&2
+    if [[ -n "${SYNC_LOG:-}" && -f "$SYNC_LOG" ]]; then
+      printf '%s\n' '--- sync.out ---' >&2
+      cat "$SYNC_LOG" >&2
     fi
     exit 1
   fi
@@ -200,11 +200,14 @@ run_sync() {
   shift
   cmp -s "$REAL_SYNC" "$work/scripts/sync-upstream.sh" \
     || fail "refusing to run a script that is not the real sync script"
-  : >"$work/github-output"
-  : >"$work/hook-mark"
+  EVIDENCE="$SB_ROOT/github-output"
+  HOOK_LOG="$SB_ROOT/hook-mark"
+  SYNC_LOG="$SB_ROOT/sync.out"
+  : >"$EVIDENCE"
+  : >"$HOOK_LOG"
   local cmd=(env -u FORK_SYNC_TOKEN
-    "HOOK_MARK=$work/hook-mark"
-    "GITHUB_OUTPUT=$work/github-output"
+    "HOOK_MARK=$HOOK_LOG"
+    "GITHUB_OUTPUT=$EVIDENCE"
     "ORIGIN_BARE=$SB_ROOT/origin.git"
     "FORK_SYNC_TOKEN_REQUIRED=${FORK_SYNC_TOKEN_REQUIRED:-}"
   )
@@ -215,7 +218,7 @@ run_sync() {
     cmd+=("FORK_SYNC_TOKEN=$PASS_TOKEN")
   fi
   set +e
-  "${cmd[@]}" "$work/scripts/sync-upstream.sh" "$@" >"$work/sync.out" 2>&1
+  "${cmd[@]}" "$work/scripts/sync-upstream.sh" "$@" >"$SYNC_LOG" 2>&1
   SYNC_RC=$?
   set -e
   unset SPOIL_JKUBO SPOIL_SHA PASS_TOKEN FORK_SYNC_TOKEN_REQUIRED || true
@@ -244,7 +247,7 @@ scenario_success() {
   seed_fork "$work"
   advance_upstream "$work" bash -c "printf 'upstream-moved\n' > README.md"
   # CI shape: checkout is jkubo and local main does not exist yet.
-  git -C "$work" branch -D main
+  git -C "$work" branch -D main >/dev/null
   install_hook "$work"
   local origin_main_before origin_jkubo_before
   origin_main_before="$(ref_sha "$SB_ROOT/origin.git" main)"
@@ -266,14 +269,14 @@ scenario_success() {
   if git -C "$work" cat-file -e main:FORK.md 2>/dev/null; then
     fail "main contains fork delta"
   fi
-  assert_eq "$(out_value changed "$work/github-output")" "true" "changed"
-  assert_eq "$(out_value sha "$work/github-output")" "$(git -C "$work" rev-parse jkubo)" \
+  assert_eq "$(out_value changed "$EVIDENCE")" "true" "changed"
+  assert_eq "$(out_value sha "$EVIDENCE")" "$(git -C "$work" rev-parse jkubo)" \
     "evidence sha"
-  assert_eq "$(out_value main "$work/github-output")" "$UP_SHA" "evidence main"
-  assert_eq "$(out_value upstream "$work/github-output")" "$UP_SHA" "evidence upstream"
-  assert_eq "$(grep -c hooked "$work/hook-mark")" "1" "one normal pre-push hook"
+  assert_eq "$(out_value main "$EVIDENCE")" "$UP_SHA" "evidence main"
+  assert_eq "$(out_value upstream "$EVIDENCE")" "$UP_SHA" "evidence upstream"
+  assert_eq "$(grep -c hooked "$HOOK_LOG")" "1" "one normal pre-push hook"
   [[ "$origin_main_before" != "$UP_SHA" ]] || fail "fixture did not actually move upstream"
-  grep -F "fork sha=$(git -C "$work" rev-parse jkubo) changed=true" "$work/sync.out" >/dev/null \
+  grep -F "fork sha=$(git -C "$work" rev-parse jkubo) changed=true" "$SYNC_LOG" >/dev/null \
     || fail "log SHA evidence does not match jkubo"
   say "success"
 }
@@ -292,8 +295,8 @@ scenario_noop() {
   assert_eq "$(git -C "$work" rev-parse main)" "$main_sha" "main SHA unchanged"
   assert_eq "$(ref_sha "$SB_ROOT/origin.git" jkubo)" "$tip" "origin/jkubo unchanged"
   assert_eq "$(ref_sha "$SB_ROOT/origin.git" main)" "$main_sha" "origin/main unchanged"
-  assert_eq "$(out_value changed "$work/github-output")" "false" "changed"
-  assert_eq "$(out_value sha "$work/github-output")" "$tip" "evidence sha is the delivered fixture head"
+  assert_eq "$(out_value changed "$EVIDENCE")" "false" "changed"
+  assert_eq "$(out_value sha "$EVIDENCE")" "$tip" "evidence sha is the delivered fixture head"
   say "no-op"
 }
 
@@ -343,21 +346,21 @@ scenario_rollback() {
   assert_eq "$(ref_sha "$SB_ROOT/origin.git" jkubo)" "$tip" "origin/jkubo not pushed"
   assert_eq "$(ref_sha "$SB_ROOT/origin.git" main)" "$main_sha" "origin/main not pushed"
   no_rebase_left "$work"
-  assert_eq "$(out_value changed "$work/github-output")" "false" "changed after rollback"
-  assert_eq "$(out_value sha "$work/github-output")" "$tip" "sha after rollback"
-  [[ ! -s "$work/hook-mark" ]] || fail "push hook ran during conflict rollback"
-  grep -F "left untouched at ${tip}" "$work/sync.out" >/dev/null \
+  assert_eq "$(out_value changed "$EVIDENCE")" "false" "changed after rollback"
+  assert_eq "$(out_value sha "$EVIDENCE")" "$tip" "sha after rollback"
+  [[ ! -s "$HOOK_LOG" ]] || fail "push hook ran during conflict rollback"
+  grep -F "left untouched at ${tip}" "$SYNC_LOG" >/dev/null \
     || fail "conflict log does not name the restored SHA"
 
   # Fresh CI checkout: no local main. A conflict must not leave one behind.
-  git -C "$work" branch -D main
+  git -C "$work" branch -D main >/dev/null
   run_sync "$work" --push
   assert_rc 1 "conflict without local main"
   assert_eq "$(git -C "$work" rev-parse jkubo)" "$tip" "jkubo restored in CI shape"
   if git -C "$work" show-ref --verify --quiet refs/heads/main; then
     fail "conflict created local main"
   fi
-  assert_eq "$(out_value main "$work/github-output")" "absent" "main evidence absent"
+  assert_eq "$(out_value main "$EVIDENCE")" "absent" "main evidence absent"
   assert_eq "$(ref_sha "$SB_ROOT/origin.git" main)" "$main_sha" "origin/main still unchanged"
   no_rebase_left "$work"
   say "conflict rollback"
@@ -413,7 +416,7 @@ scenario_exact_head() {
   run_sync "$work" --push
   assert_rc 0 "exact head sync"
   assert_eq "$(git -C "$work" rev-parse jkubo)" "$tip" "fixture patched head SHA unchanged"
-  assert_eq "$(out_value sha "$work/github-output")" "$tip" "output sha is the patched head"
+  assert_eq "$(out_value sha "$EVIDENCE")" "$tip" "output sha is the patched head"
   assert_eq "$(git -C "$work" rev-parse "jkubo:scripts/sync-upstream.sh")" "$delivered_blob" \
     "patched head blob is the delivered script"
   say "exact fixture patched head ${tip}"
@@ -430,23 +433,23 @@ scenario_dirty() {
   printf 'dirty\n' >>"$work/README.md"
   run_sync "$work" --push
   assert_rc 1 "dirty tracked tree"
-  grep -F 'working tree is dirty' "$work/sync.out" >/dev/null || fail "dirty error missing"
+  grep -F 'working tree is dirty' "$SYNC_LOG" >/dev/null || fail "dirty error missing"
   assert_eq "$(git -C "$work" rev-parse jkubo)" "$tip" "dirty refusal left jkubo"
   assert_eq "$(git -C "$work" rev-parse main)" "$main_sha" "dirty refusal left main"
-  [[ ! -s "$work/hook-mark" ]] || fail "dirty refusal pushed"
+  [[ ! -s "$HOOK_LOG" ]] || fail "dirty refusal pushed"
   git -C "$work" checkout -q -- README.md
 
   printf 'untracked\n' >"$work/untracked.txt"
   run_sync "$work"
   assert_rc 1 "dirty untracked tree"
-  grep -F 'working tree is dirty' "$work/sync.out" >/dev/null || fail "untracked error missing"
+  grep -F 'working tree is dirty' "$SYNC_LOG" >/dev/null || fail "untracked error missing"
   assert_eq "$(git -C "$work" rev-parse jkubo)" "$tip" "untracked refusal left jkubo"
   rm -f "$work/untracked.txt"
 
   printf 'dirty-again\n' >>"$work/README.md"
   run_sync "$work" --dry-run
   assert_rc 0 "dry-run on a dirty tree"
-  grep -F '[dry-run]' "$work/sync.out" >/dev/null || fail "dry-run produced no report"
+  grep -F '[dry-run]' "$SYNC_LOG" >/dev/null || fail "dry-run produced no report"
   assert_eq "$(git -C "$work" rev-parse jkubo)" "$tip" "dry-run left jkubo"
   assert_eq "$(git -C "$work" rev-parse main)" "$main_sha" "dry-run left main"
   git -C "$work" checkout -q -- README.md
@@ -465,12 +468,12 @@ scenario_absent_token() {
   origin_main="$(ref_sha "$SB_ROOT/origin.git" main)"
   FORK_SYNC_TOKEN_REQUIRED=1 run_sync "$work" --push
   assert_rc 1 "absent token"
-  grep -F 'FORK_SYNC_TOKEN is absent. Refusing to push.' "$work/sync.out" >/dev/null \
+  grep -F 'FORK_SYNC_TOKEN is absent. Refusing to push.' "$SYNC_LOG" >/dev/null \
     || fail "absent-token error missing"
   assert_eq "$(git -C "$work" rev-parse jkubo)" "$tip" "token refusal left jkubo"
   assert_eq "$(git -C "$work" rev-parse main)" "$main_sha" "token refusal left main"
   assert_eq "$(ref_sha "$SB_ROOT/origin.git" main)" "$origin_main" "token refusal did not push main"
-  [[ ! -s "$work/hook-mark" ]] || fail "token refusal reached the push hook"
+  [[ ! -s "$HOOK_LOG" ]] || fail "token refusal reached the push hook"
   say "absent FORK_SYNC_TOKEN"
 }
 
@@ -486,7 +489,7 @@ scenario_lease() {
   commit_tree "$work" "spoiler"
   local spoil tip main_sha
   spoil="$(git -C "$work" rev-parse HEAD)"
-  git -C "$work" push -q origin "${spoil}:refs/spoiler"
+  git -C "$work" push -q origin "${spoil}:refs/heads/spoiler"
   git -C "$work" checkout -q jkubo
   git -C "$work" branch -D spoiler >/dev/null
   tip="$(git -C "$work" rev-parse jkubo)"
@@ -494,13 +497,13 @@ scenario_lease() {
   install_hook "$work"
   SPOIL_JKUBO=1 SPOIL_SHA="$spoil" run_sync "$work" --push
   assert_rc 1 "lease rejection"
-  grep -F spoiled "$work/hook-mark" >/dev/null || fail "pre-push hook did not run"
+  grep -F spoiled "$HOOK_LOG" >/dev/null || fail "pre-push hook did not run"
   assert_eq "$(git -C "$work" rev-parse jkubo)" "$tip" "local jkubo rolled back"
   assert_eq "$(git -C "$work" rev-parse main)" "$main_sha" "local main rolled back"
   assert_eq "$(ref_sha "$SB_ROOT/origin.git" jkubo)" "$spoil" "remote jkubo stayed at the hook's update"
   assert_eq "$(ref_sha "$SB_ROOT/origin.git" main)" "$main_sha" "atomic push did not advance origin/main"
-  assert_eq "$(out_value changed "$work/github-output")" "false" "changed after push rollback"
-  assert_eq "$(out_value sha "$work/github-output")" "$tip" "sha after push rollback"
+  assert_eq "$(out_value changed "$EVIDENCE")" "false" "changed after push rollback"
+  assert_eq "$(out_value sha "$EVIDENCE")" "$tip" "sha after push rollback"
   no_rebase_left "$work"
   say "push lease rollback"
 }
