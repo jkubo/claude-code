@@ -6,6 +6,11 @@ name: sync-upstream
 # for a human: this tree is not watched, and a script that forces a conflicted
 # rebase through would corrupt the fork delta silently, which is strictly worse
 # than a red run nobody reads today and someone reads on Monday.
+#
+# Checkout and push use FORK_SYNC_TOKEN. The job GITHUB_TOKEN stays read-only
+# because a contents-only installation token cannot push upstream workflow
+# files. The secret is checked before checkout and again inside the sync
+# script before any branch moves. The value is never printed. See FORK.md.
 
 on:
   schedule:
@@ -13,7 +18,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: sync-upstream
@@ -23,12 +28,27 @@ jobs:
   rebase:
     runs-on: ubuntu-latest
     steps:
+      - name: Require fork sync token
+        id: require
+        env:
+          FORK_SYNC_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          value="${FORK_SYNC_TOKEN//[[:space:]]/}"
+          if [ -z "$value" ]; then
+            echo "FORK_SYNC_TOKEN is absent. Refusing to push."
+            echo "See FORK.md. Create a fine-grained token for jkubo/claude-code with Contents write and Workflows write, or a GitHub App limited to those repository permissions on this repository only."
+            exit 1
+          fi
+          unset value
+
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
           # Full history: a rebase cannot replay against a shallow clone.
           fetch-depth: 0
           ref: jkubo
+          token: ${{ secrets.FORK_SYNC_TOKEN }}
+          persist-credentials: true
 
       - name: Configure identity
         run: |
@@ -36,13 +56,19 @@ jobs:
           git config user.email "6161465+jkubo@users.noreply.github.com"
 
       - name: Sync
+        id: sync
+        env:
+          FORK_SYNC_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          FORK_SYNC_TOKEN_REQUIRED: "1"
         run: |
           chmod +x scripts/sync-upstream.sh
           ./scripts/sync-upstream.sh --push
 
       - name: Report
-        if: failure()
+        if: failure() && steps.sync.conclusion == 'failure'
         run: |
-          echo "Rebase onto anthropics/claude-code conflicted, or main carried fork delta."
-          echo "Nothing was pushed. Resolve locally:"
+          echo "Sync failed before a successful push."
+          echo "The sync log prints the fork sha and changed flag after rollback."
+          echo "A rebase conflict, a main branch that is not an exact fast-forward, or a rejected push leaves both branches unpushed."
+          echo "Resolve locally:"
           echo "  ./scripts/sync-upstream.sh"

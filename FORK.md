@@ -50,11 +50,19 @@ fast forwards, and only `jkubo` ever has to replay.
 ./scripts/sync-upstream.sh              # fetch + rebase jkubo onto upstream/main
 ./scripts/sync-upstream.sh --push       # also update origin/jkubo and origin/main
 ./scripts/sync-upstream.sh --dry-run    # show what would happen, touch nothing
+./scripts/test-sync-upstream.sh         # run the script against disposable local remotes
 ```
 
 Happy path is a plain `git rebase` of the `jkubo` commits onto `upstream/main`.
-If that conflicts the script aborts and leaves `jkubo` exactly where it was,
-rather than leaving you in a half finished rebase. Resolve by hand, then re run.
+If that conflicts, or the push is rejected, the script restores both `jkubo`
+and `main` to the SHAs from the start of the run and exits. It does not leave
+a half finished rebase. Resolve by hand, then re run.
+
+The exit path prints the full fork SHA and `changed=true` or `changed=false`.
+`changed` is true only when `jkubo` ended on a different commit than it started
+on. `main` is updated only when that update is a fast forward onto the exact
+upstream commit. A `main` that is ahead of upstream, or has diverged, is left
+where it was.
 
 Upstream does not accept external PRs for the bundled plugins, and the CLI is
 not open source, so **do not open a PR against `anthropics/claude-code`** from
@@ -63,8 +71,91 @@ this tree. File an issue there instead if something is genuinely upstream's bug.
 ### Automation
 
 `.github/workflows/sync-upstream.yml` runs the rebase daily and pushes both
-branches. It only pushes when the rebase is clean; a conflicting day is left
-for a human, which is the correct failure mode for a tree nobody is watching.
+branches when the rebase is clean. A conflicting day is left for a human,
+which is the correct failure mode for a tree nobody is watching.
+
+The push contains whatever `.github/workflows` files upstream changed.
+`GITHUB_TOKEN` is a GitHub App installation token for this job. GitHub
+rejects a push that creates or updates workflow files unless the token has
+the Workflows permission. This workflow does not grant that permission to
+`GITHUB_TOKEN`. The job permission is `contents: read`. Checkout persists
+`FORK_SYNC_TOKEN` and the push uses that credential:
+
+```yaml
+token: ${{ secrets.FORK_SYNC_TOKEN }}
+```
+
+The workflow refuses to continue when that secret is empty or whitespace,
+and it does so before checkout. The sync script checks again, before it
+fetches or moves a branch, when `FORK_SYNC_TOKEN_REQUIRED=1`. The workflow
+sets that variable. The secret value is not printed.
+
+#### Fine-grained token
+
+Use a fine-grained personal access token. Do not install a broader admin or
+delete token as this secret. GitHub documents the creation form and these
+query parameters (`name`, `description`, `target_name`, `expires_in`, and
+one parameter per permission). This is the prepared link:
+
+```text
+https://github.com/settings/personal-access-tokens/new?name=Claude+Code+fork+sync&description=Daily+upstream+sync+for+jkubo%2Fclaude-code&target_name=jkubo&expires_in=90&contents=write&workflows=write
+```
+
+On that form set Resource owner to `jkubo`, Repository access to **Only
+select repositories**, and select only `jkubo/claude-code`. Repository
+selection is not a documented URL parameter, so the link does not do it.
+
+From the fine-grained token documentation checked on 2026-10-08:
+
+| Permission | Level to grant | Why |
+|------------|----------------|-----|
+| Contents | `write` (includes read) | HTTP git fetch and push |
+| Workflows | `write` only | edit files under `.github/workflows`. GitHub's example text for `workflows=write` is the permission to edit workflow files. The table has no Workflows read level. |
+
+Grant nothing else. No organization permissions. No account permissions.
+This is a user-owned repository, and no organization policy is changed.
+
+GitHub documents that every fine-grained token also has read-only access to
+all public repositories. That is platform behavior. Write access stays on
+the selected repository.
+
+GitHub's documented `contents=read` example also includes Metadata read.
+[UNVERIFIED: this session did not open the live generate page for the
+combined `contents=write` and `workflows=write` URL.] Read the summary
+before generating. Stop if any write other than Contents and Workflows is
+listed. Metadata read is the expected extra.
+
+Store the value when `gh` prompts. Do not commit it, and do not paste it
+into a chat or a file in this tree:
+
+```sh
+gh secret set FORK_SYNC_TOKEN --repo jkubo/claude-code
+```
+
+The secret was empty on the 2026-10-08 re-entry check recorded by the
+operator plan. This clone does not set it. `scripts/test-sync-upstream.sh`
+pushes only to local scratch remotes. A passing local run is not a GitHub
+Actions run. The daily workflow stays red until that secret exists.
+
+#### GitHub App alternative
+
+The platform allows a GitHub App with no permissions until some are
+selected. The permissions guide says Contents is what lets an installation
+token authenticate for HTTP git, and Workflows is what lets it edit
+`.github/workflows`. Install it on the personal account. The install flow
+offers **Only select repositories**; select only `jkubo/claude-code`. Grant
+no organization permissions and no account permissions.
+
+[UNVERIFIED: the registration form's exact Workflows access-level label was
+not clicked through in this session. The documented requirement is the
+Workflows repository permission in order to edit workflow files.]
+
+[UNVERIFIED: installation access token lifetime was not re-checked against
+current docs in this session.] This workflow does not mint an app token. It
+reads `FORK_SYNC_TOKEN`. Put an installation token in that secret only when
+its lifetime covers the daily run. Otherwise mint one inside the job from
+an app id and a private key, which is a different workflow than the one
+checked in here.
 
 ## Inherited workflows
 
