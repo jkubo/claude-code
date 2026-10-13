@@ -1,0 +1,74 @@
+name: sync-upstream
+
+# Keep the jkubo fork current with anthropics/claude-code.
+#
+# Pushes only when the rebase is clean. A conflicting day is deliberately left
+# for a human: this tree is not watched, and a script that forces a conflicted
+# rebase through would corrupt the fork delta silently, which is strictly worse
+# than a red run nobody reads today and someone reads on Monday.
+#
+# Checkout and push use FORK_SYNC_TOKEN. The job GITHUB_TOKEN stays read-only
+# because a contents-only installation token cannot push upstream workflow
+# files. The secret is checked before checkout and again inside the sync
+# script before any branch moves. The value is never printed. See FORK.md.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require fork sync token
+        id: require
+        env:
+          FORK_SYNC_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          value="${FORK_SYNC_TOKEN//[[:space:]]/}"
+          if [ -z "$value" ]; then
+            echo "FORK_SYNC_TOKEN is absent. Refusing to push."
+            echo "See FORK.md. Create a fine-grained token for jkubo/claude-code with Contents write and Workflows write, or a GitHub App limited to those repository permissions on this repository only."
+            exit 1
+          fi
+          unset value
+
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          # Full history: a rebase cannot replay against a shallow clone.
+          fetch-depth: 0
+          ref: jkubo
+          token: ${{ secrets.FORK_SYNC_TOKEN }}
+          persist-credentials: true
+
+      - name: Configure identity
+        run: |
+          git config user.name  "Jay Kubo"
+          git config user.email "6161465+jkubo@users.noreply.github.com"
+
+      - name: Sync
+        id: sync
+        env:
+          FORK_SYNC_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          FORK_SYNC_TOKEN_REQUIRED: "1"
+        run: |
+          chmod +x scripts/sync-upstream.sh
+          ./scripts/sync-upstream.sh --push
+
+      - name: Report
+        if: failure() && steps.sync.conclusion == 'failure'
+        run: |
+          echo "Sync failed."
+          echo "Inspect the sync log for the fork sha, main sha, changed flag, and whether publication succeeded."
+          echo "A rejected atomic push leaves remote targets unchanged and keeps completed local work. A later checkout failure can follow a successful push."
+          echo "Resolve locally:"
+          echo "  ./scripts/sync-upstream.sh"
